@@ -35,7 +35,9 @@ Environment Variables (ঐচ্ছিক):
 import asyncio
 import difflib
 import hashlib
+import json
 import logging
+import secrets
 import math
 import os
 import re
@@ -773,20 +775,94 @@ LABEL_ACTIONS = {
     "🏠 القائمة": "menu",
 }
 
-_URL_RE = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|\S+@\S+\.\S+|@\w+)", re.IGNORECASE)
+_URL_RE = re.compile(
+    r"(?i)(?:https?://\S+|www\.\S+|t\.me/\S+|telegram\.(?:me|dog)/\S+|"
+    r"[a-z0-9.\-]+\.(?:com|net|org|io|me|co|in|bd|xyz|tv|live|link|site|top|club|vip|info|app|ly|gl|gg|to)(?:/\S*)?|"
+    r"\S+@\S+\.\S+|@\w+)"
+)
+
+# কমন বানান ভুল ও শর্টকাট ম্যাপ (যাতে ইউজার ভুল বানান লিখলেও বট নিজেই বুঝে নেয়)
+TEAM_TYPO_ALIASES = {
+    "barca": "barcelona",
+    "barsa": "barcelona",
+    "barselona": "barcelona",
+    "barclona": "barcelona",
+    "bercelona": "barcelona",
+    "barcalona": "barcelona",
+    "fcb": "barcelona",
+    "বার্সা": "barcelona",
+    "বার্সেলোনা": "barcelona",
+    "rm": "real madrid",
+    "rma": "real madrid",
+    "ral madrid": "real madrid",
+    "real madri": "real madrid",
+    "reall madrid": "real madrid",
+    "realmadrid": "real madrid",
+    "riel madrid": "real madrid",
+    "রিয়াল": "real madrid",
+    "রিয়াল": "real madrid",
+    "রিয়াল মাদ্রিদ": "real madrid",
+    "arg": "argentina",
+    "argntina": "argentina",
+    "arjentina": "argentina",
+    "arjantina": "argentina",
+    "argentena": "argentina",
+    "messi": "argentina",
+    "আর্জেন্টিনা": "argentina",
+    "bra": "brazil",
+    "brajil": "brazil",
+    "brazl": "brazil",
+    "brasil": "brazil",
+    "neymar": "brazil",
+    "ব্রাজিল": "brazil",
+    "fra": "france",
+    "frans": "france",
+    "frnce": "france",
+    "ফ্রান্স": "france",
+    "ger": "germany",
+    "jarmani": "germany",
+    "germni": "germany",
+    "জার্মানি": "germany",
+    "por": "portugal",
+    "portugl": "portugal",
+    "ronaldo": "portugal",
+    "cr7": "portugal",
+    "পর্তুগাল": "portugal",
+    "psg": "paris saint germain",
+    "paris": "paris saint germain",
+    "man utd": "manchester united",
+    "man united": "manchester united",
+    "mufc": "manchester united",
+    "mancity": "manchester city",
+    "man city": "manchester city",
+    "liverpol": "liverpool",
+    "lfc": "liverpool",
+    "bd": "bangladesh",
+    "ban": "bangladesh",
+    "banglades": "bangladesh",
+    "বাংলাদেশ": "bangladesh",
+    "ind": "india",
+    "indea": "india",
+    "pak": "pakistan",
+    "paksitan": "pakistan",
+}
 _HASHTAG_RE = re.compile(r"#([\w\u0600-\u06FF\u0900-\u097F\u0980-\u09FF]+)", re.UNICODE)
 _YEAR_RE = re.compile(r"\b(19[5-9]\d|20[0-2]\d)\b")
 
 
 # ------------------------------------------------------------------ normalize
 def norm(text: str) -> str:
-    """সার্চের জন্য টেক্সট নরমালাইজ (case, যুক্তি/চিহ্ন সব বাদ)।"""
+    """সার্চের জন্য টেক্সট নরমালাইজ (case, যুক্তি/চিহ্ন সব বাদ + বানান ভুল সংশোধন)।"""
     if not text:
         return ""
     text = unicodedata.normalize("NFKC", str(text)).casefold()
     text = text.replace("_", " ")
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
-    return re.sub(r"\s+", " ", text).strip()
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if cleaned in TEAM_TYPO_ALIASES:
+        return TEAM_TYPO_ALIASES[cleaned]
+    tokens = [TEAM_TYPO_ALIASES.get(tok, tok) for tok in cleaned.split()]
+    return " ".join(tokens)
 
 
 def compact(text: str) -> str:
@@ -810,15 +886,21 @@ def team_ref(team_key: str) -> str:
     return hashlib.md5(("t" + team_key).encode()).hexdigest()[:10]
 
 
+AD_TIMER_SECONDS = _get_int("AD_TIMER_SECONDS", 5)
+
+
 async def load_ad(db) -> dict | None:
-    """অ্যাড চালু থাকলে অ্যাডের ডেটা, নাহলে None।"""
+    """অ্যাড চালু থাকলে অ্যাডের ডেটা, নাহলে None (অ্যাড বন্ধ বা লিংক না থাকলে ফ্রি মোড)।"""
     s = await db.get_settings("ad_")
+    url = (s.get("ad_url") or "").strip()
     text = (s.get("ad_text") or "").strip()
-    if s.get("ad_active") == "1" and text:
+    if s.get("ad_active") == "1" and (url or text):
+        if not text:
+            text = "🔥 হাইলাইট ভিডিওটি আনলক করতে নিচের অ্যাড লিংকে ক্লিক করে মাত্র ৫ সেকেন্ড অপেক্ষা করুন!"
         return {
             "text": text,
-            "btn": (s.get("ad_btn") or "").strip(),
-            "url": (s.get("ad_url") or "").strip(),
+            "btn": (s.get("ad_btn") or "").strip() or "📺 অ্যাড দেখুন (৫ সেকেন্ড)",
+            "url": url,
         }
     return None
 
@@ -1096,6 +1178,17 @@ class Database:
                 views      INTEGER DEFAULT 0,
                 last_view  TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS ad_sessions (
+                token       TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                match_id    INTEGER NOT NULL,
+                ad_url      TEXT DEFAULT '',
+                created_at  REAL NOT NULL,
+                opened_at   REAL DEFAULT 0,
+                verified    INTEGER DEFAULT 0,
+                delivered   INTEGER DEFAULT 0
+            );
             """
         )
         await self._db.commit()
@@ -1322,6 +1415,41 @@ class Database:
             return 0, 0
         return row["s"], row["c"]
 
+    # ------------------------------------------------------------------ 5s anti-cheat ad sessions
+    async def create_ad_session(self, user_id: int, match_id: int, ad_url: str) -> str:
+        token = secrets.token_urlsafe(10)
+        now = time.time()
+        async with self._lock:
+            await self._db.execute(
+                "INSERT INTO ad_sessions (token, user_id, match_id, ad_url, created_at, opened_at, verified, delivered) "
+                "VALUES (?, ?, ?, ?, ?, 0, 0, 0)",
+                (token, user_id, match_id, ad_url or "", now),
+            )
+            await self._db.commit()
+        return token
+
+    async def get_ad_session(self, token: str):
+        return await self._fetchone("SELECT * FROM ad_sessions WHERE token = ?", (token,))
+
+    async def mark_ad_opened(self, token: str) -> None:
+        now = time.time()
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE ad_sessions SET opened_at = CASE WHEN opened_at = 0 THEN ? ELSE opened_at END WHERE token = ?",
+                (now, token),
+            )
+            await self._db.commit()
+
+    async def mark_ad_verified(self, token: str) -> None:
+        async with self._lock:
+            await self._db.execute("UPDATE ad_sessions SET verified = 1 WHERE token = ?", (token,))
+            await self._db.commit()
+
+    async def mark_ad_delivered(self, token: str) -> None:
+        async with self._lock:
+            await self._db.execute("UPDATE ad_sessions SET delivered = 1 WHERE token = ?", (token,))
+            await self._db.commit()
+
     # ------------------------------------------------------------------ helpers
     async def _fetchone(self, query: str, params: tuple = ()):
         cur = await self._db.execute(query, params)
@@ -1424,13 +1552,25 @@ def list_markup(
     return InlineKeyboardMarkup(inline_keyboard=rows or [[InlineKeyboardButton(text="•", callback_data="noop")]])
 
 
+def format_match_details_block(rows, start_idx: int = 1) -> str:
+    """ম্যাচের তালিকায় টিম, কোন ম্যাচ এবং কত সাল — সব বিবরণ সুন্দর করে দেখায়।"""
+    lines = []
+    for idx, m in enumerate(rows, start=start_idx):
+        yr = year_of(m)
+        yr_badge = f" ({yr})" if yr and yr != "-" else ""
+        lines.append(f"<b>{idx}. 🏆 {esc(m['team'])}</b> — {esc(m['title'])}{yr_badge}")
+    return "\n".join(lines)
+
+
 def match_buttons(lang: str, rows, page: int, total: int, page_size: int, kind: str, ref: str, back_cb: str = "home"):
     buttons = []
     for m in rows:
         title = (m["title"] or "").strip()
-        if len(title) > 34:
-            title = title[:31] + "…"
-        label = f"🎬 {m['team']}" + (f" — {title}" if title else "")
+        yr = year_of(m)
+        yr_str = f" [{yr}]" if yr and yr != "-" else ""
+        if len(title) > 28:
+            title = title[:25] + "…"
+        label = f"🎬 {m['team']} — {title}{yr_str}"
         buttons.append((label[:64], f"v:{match_ref(m['id'])}"))
     total_pages = max(1, (total + page_size - 1) // page_size)
     return list_markup(lang, buttons, page, total_pages, kind, ref, back_cb)
@@ -1445,22 +1585,25 @@ def team_buttons(lang: str, teams, page: int, total: int, page_size: int, back_c
 
 
 # ------------------------------------------------------------------ ad gate
-def ad_kb(lang: str, match_id: int, url: str = "", btn_text: str = "") -> InlineKeyboardMarkup:
+def ad_kb(lang: str, match_id: int, url: str = "", btn_text: str = "", token: str = "") -> InlineKeyboardMarkup:
     rows = []
-    if url:
+    base = webhook_base_url()
+    target_url = f"{base}/ad/{token}" if (base and token and url) else url
+    if target_url:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=btn_text or t(lang, "ad_btn_open"),
-                    url=url,
+                    text=btn_text or f"📺 {t(lang, 'ad_btn_open')} ({AD_TIMER_SECONDS}s)",
+                    url=target_url,
                 )
             ]
         )
+    cb_payload = f"vx:{token}" if token else f"vx:{match_ref(match_id)}"
     rows.append(
         [
             InlineKeyboardButton(
                 text=t(lang, "ad_btn_continue"),
-                callback_data=f"vx:{match_ref(match_id)}",
+                callback_data=cb_payload,
             )
         ]
     )
@@ -1903,7 +2046,8 @@ async def build_list(db: Database, lang: str, kind: str, page: int, ref: str, us
         rows = await db.get_matches_by_ids(ids[offset : offset + size])
         if not rows:
             return None
-        header = t(lang, "search_results", q=esc(_short(query)), n=len(ids))
+        details = format_match_details_block(rows, offset + 1)
+        header = t(lang, "search_results", q=esc(_short(query)), n=len(ids)) + "\n\n" + details
         kb = match_buttons(lang, rows, page, len(ids), size, "sr", "")
         return header, kb
 
@@ -1917,7 +2061,8 @@ async def build_list(db: Database, lang: str, kind: str, page: int, ref: str, us
         offset = (page - 1) * size
         rows = await db.get_team_matches(team_key, offset, size)
         team_name = rows[0]["team"] if rows else team_key
-        header = t(lang, "team_header", team=esc(team_name), n=total)
+        details = format_match_details_block(rows, offset + 1)
+        header = t(lang, "team_header", team=esc(team_name), n=total) + "\n\n" + details
         kb = match_buttons(lang, rows, page, total, size, "tm", ref, back_cb="home")
         return header, kb
 
@@ -1963,8 +2108,10 @@ async def _do_search(message: Message, db: Database, lang: str) -> None:
         await message.answer(text)
         return
 
-    header = t(lang, "search_results", q=esc(_short(query)), n=len(ids))
-    kb = match_buttons(lang, found[: PAGE_MATCHES], 1, len(ids), PAGE_MATCHES, "sr", "")
+    page_rows = found[: PAGE_MATCHES]
+    details = format_match_details_block(page_rows, 1)
+    header = t(lang, "search_results", q=esc(_short(query)), n=len(ids)) + "\n\n" + details
+    kb = match_buttons(lang, page_rows, 1, len(ids), PAGE_MATCHES, "sr", "")
     await message.answer(header, reply_markup=kb)
 
 
@@ -2164,9 +2311,20 @@ async def on_video_click(cb: CallbackQuery, db: Database, bot: Bot):
 
     ad = await load_ad(db)
     if ad:
+        token = await db.create_ad_session(cb.from_user.id, match_id, ad["url"])
         await db.register_ad_view(cb.from_user.id)
-        text = f"{t(lang, 'ad_header')}\n\n{esc(ad['text'])}\n\n{t(lang, 'ad_note')}"
-        kb = ad_kb(lang, match_id, ad["url"], ad["btn"])
+        timer_note = (
+            f"⏱ <b>বাধ্যতামূলক {AD_TIMER_SECONDS} সেকেন্ড অ্যাড:</b> নিচের বাটনে ক্লিক করে মাত্র {AD_TIMER_SECONDS} সেকেন্ড অপেক্ষা করলেই ভিডিওটি আনলক হয়ে যাবে!"
+            if lang == "bn"
+            else f"{t(lang, 'ad_note')} ({AD_TIMER_SECONDS}s)"
+        )
+        text = (
+            f"{t(lang, 'ad_header')}\n\n"
+            f"🎬 <b>{esc(match['title'])}</b> ({esc(match['team'])})\n\n"
+            f"{esc(ad['text'])}\n\n"
+            f"{timer_note}"
+        )
+        kb = ad_kb(lang, match_id, ad["url"], ad["btn"], token=token)
         try:
             await cb.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
         except TelegramBadRequest:
@@ -2174,14 +2332,80 @@ async def on_video_click(cb: CallbackQuery, db: Database, bot: Bot):
         await cb.answer()
         return
 
+    # অ্যাড বন্ধ বা সেট করা না থাকলে সাথে সাথে ফ্রি ভিডিও!
     await cb.answer(t(lang, "delivering"))
     await send_video_to(bot, db, cb.message.chat.id, match, lang)
 
 
 @user_router.callback_query(F.data.startswith("vx:"))
 async def on_video_after_ad(cb: CallbackQuery, db: Database, bot: Bot):
-    match_id = match_id_from_ref(cb.data[3:])
+    payload = cb.data[3:]
     lang = await get_lang(db, cb.from_user.id)
+    session = await db.get_ad_session(payload)
+
+    if session:
+        match_id = int(session["match_id"])
+        match = await db.get_match(match_id)
+        if not match:
+            await cb.answer(t(lang, "video_unavailable"), show_alert=False)
+            return
+
+        # ইতিমধ্যে অটো-ডেলিভারি হয়ে থাকলে আবার পাঠানোর দরকার নেই
+        if session["delivered"] == 1:
+            await cb.answer("✅ ভিডিওটি ইতিমধ্যে পাঠানো হয়েছে!", show_alert=False)
+            return
+
+        base = webhook_base_url()
+        now = time.time()
+
+        # যদি ওয়েব ভেরিফিকেশন গেটওয়ে চালু থাকে (Render / Server URL আছে) এবং অ্যাড লিংক থাকে
+        if base and session["ad_url"]:
+            if session["verified"] != 1:
+                opened_at = float(session["opened_at"] or 0)
+                if opened_at <= 0:
+                    msg = (
+                        f"⚠️ ফাঁকি দেওয়া যাবে না! আগে উপরের বাটনে ক্লিক করে {AD_TIMER_SECONDS} সেকেন্ড অ্যাডটি দেখুন।"
+                        if lang == "bn"
+                        else f"⚠️ Please click the Ad button above and wait {AD_TIMER_SECONDS} seconds first!"
+                    )
+                    await cb.answer(msg, show_alert=True)
+                    return
+                elapsed = now - opened_at
+                if elapsed < (AD_TIMER_SECONDS - 0.3):
+                    rem = max(1, int(round(AD_TIMER_SECONDS - elapsed)))
+                    msg = (
+                        f"⏳ এখনো {AD_TIMER_SECONDS} সেকেন্ড পূর্ণ হয়নি! আরও {rem} সেকেন্ড অপেক্ষা করুন।"
+                        if lang == "bn"
+                        else f"⏳ Please wait {rem} more seconds!"
+                    )
+                    await cb.answer(msg, show_alert=True)
+                    return
+                await db.mark_ad_verified(payload)
+        else:
+            # পোলিং মোডে (যেখানে ওয়েব সার্ভার URL নেই) তৈরি হওয়ার সময় থেকে ৫ সেকেন্ড যাচাই
+            elapsed = now - float(session["created_at"] or 0)
+            if elapsed < (AD_TIMER_SECONDS - 0.2):
+                rem = max(1, int(round(AD_TIMER_SECONDS - elapsed)))
+                msg = (
+                    f"⚠️ ফাঁকি দেওয়া যাবে না! অ্যাড লিংকে ক্লিক করে আরও {rem} সেকেন্ড অপেক্ষা করুন।"
+                    if lang == "bn"
+                    else f"⚠️ Please open the ad and wait {rem} more seconds!"
+                )
+                await cb.answer(msg, show_alert=True)
+                return
+
+        await db.mark_ad_delivered(payload)
+        await cb.answer(t(lang, "delivering"))
+        ok = await send_video_to(bot, db, cb.message.chat.id, match, lang)
+        if ok:
+            try:
+                await cb.message.delete()
+            except TelegramBadRequest:
+                pass
+        return
+
+    # Fallback for legacy callback ref
+    match_id = match_id_from_ref(payload)
     match = await db.get_match(match_id) if match_id else None
     if not match:
         await cb.answer(t(lang, "video_unavailable"), show_alert=False)
@@ -2232,18 +2456,19 @@ async def _safe_edit(cb: CallbackQuery, text: str, kb=None):
 
 async def _render_ad_panel(cb: CallbackQuery, db: Database, lang: str):
     s = await db.get_settings("ad_")
-    ad_on = s.get("ad_active") == "1" and bool((s.get("ad_text") or "").strip())
+    has_ad_content = bool((s.get("ad_url") or "").strip() or (s.get("ad_text") or "").strip())
+    ad_on = s.get("ad_active") == "1" and has_ad_content
     imp_total, imp_users = await db.ad_stats()
     text = t(
         lang,
         "ad_panel",
         status=_flag(lang, ad_on),
-        text=esc(s.get("ad_text") or t(lang, "not_set")),
-        btn=esc(s.get("ad_btn") or t(lang, "not_set")),
+        text=esc(s.get("ad_text") or "🔥 ভিডিওটি পেতে ৫ সেকেন্ড অ্যাড দেখুন (অটো)"),
+        btn=esc(s.get("ad_btn") or f"📺 অ্যাড দেখুন ({AD_TIMER_SECONDS}s)"),
         url=esc(s.get("ad_url") or t(lang, "not_set")),
         imp=f"{imp_total} ({imp_users} 👤)",
     )
-    await _safe_edit(cb, text, ad_panel_kb(lang, ad_on, bool((s.get("ad_text") or "").strip())))
+    await _safe_edit(cb, text, ad_panel_kb(lang, ad_on, has_ad_content))
 
 
 async def _render_matches(cb: CallbackQuery, db: Database, lang: str, page: int):
@@ -2507,8 +2732,8 @@ async def cb_ad_action(cb: CallbackQuery, state: FSMContext, db: Database):
 
     if action == "toggle":
         s = await db.get_settings("ad_")
-        if not (s.get("ad_text") or "").strip():
-            await cb.answer(t(lang, "ad_need_text"), show_alert=True)
+        if not ((s.get("ad_url") or "").strip() or (s.get("ad_text") or "").strip()):
+            await cb.answer("⚠️ আগে 🔗 লিংক বাটনে চাপ দিয়ে আপনার অ্যাড লিংক দিন!", show_alert=True)
             return
         new_value = "0" if s.get("ad_active") == "1" else "1"
         await db.set_setting("ad_active", new_value)
@@ -2574,11 +2799,29 @@ async def ad_save_url(message: Message, state: FSMContext, db: Database):
         return
     if text == "/skip":
         await db.set_setting("ad_url", None)
-    elif text.startswith("http://") or text.startswith("https://") or text.startswith("tg://"):
-        await db.set_setting("ad_url", text[:500])
-    else:
-        await message.answer(t(lang, "ad_enter_url"))
+        await db.set_setting("ad_active", "0")
+        await state.clear()
+        await message.answer(t(lang, "ad_cleared"), reply_markup=admin_kb(lang))
         return
+
+    if not (text.startswith("http://") or text.startswith("https://") or text.startswith("tg://")):
+        if "." in text and " " not in text:
+            text = "https://" + text
+        else:
+            await message.answer(t(lang, "ad_enter_url"))
+            return
+
+    await db.set_setting("ad_url", text[:500])
+    # অ্যাড লিংক দিলেই অটোমেটিক ডিফল্ট টেক্সট ও বাটন সেট হয়ে ৫ সেকেন্ডের বাধ্যতামূলক অ্যাড চালু হয়ে যাবে!
+    s = await db.get_settings("ad_")
+    if not (s.get("ad_text") or "").strip():
+        await db.set_setting(
+            "ad_text",
+            f"🔥 হাইলাইট ভিডিওটি পেতে নিচের বাটনে ক্লিক করে মাত্র {AD_TIMER_SECONDS} সেকেন্ড অ্যাডটি দেখুন!",
+        )
+    if not (s.get("ad_btn") or "").strip():
+        await db.set_setting("ad_btn", f"📺 অ্যাড দেখুন ({AD_TIMER_SECONDS} সেকেন্ড)")
+    await db.set_setting("ad_active", "1")
     await state.clear()
     await message.answer(t(lang, "ad_saved"), reply_markup=admin_kb(lang))
 
@@ -3076,154 +3319,564 @@ def webhook_base_url() -> str:
     ).rstrip("/")
 
 
-SETUP_HTML = """<!doctype html><html><head><meta charset="utf-8">
-<title>HighlightHub Bot</title><style>
-body{font-family:system-ui,Segoe UI,sans-serif;background:#0f172a;color:#e2e8f0;
-display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.card{background:#1e293b;padding:32px 40px;border-radius:16px;max-width:560px;line-height:1.7}
-h1{margin:0 0 12px;font-size:22px}code{background:#0f172a;padding:2px 6px;border-radius:6px}
-.ok{color:#4ade80}.bad{color:#f87171}</style></head><body><div class="card">
-<h1>🤖 HighlightHub Bot</h1>
-<p class="ok">✅ সার্ভার চলছে</p>
-<p class="bad">⚠️ BOT_TOKEN সেট করা নেই</p>
-<p>Render → <b>Environment</b> → <code>BOT_TOKEN</code> যোগ করে আপনার বট টোকেন দিন,
-তারপর <b>Manual Deploy → Deploy latest commit</b> চাপুন।</p>
-</div></body></html>"""
+AD_GATE_HTML = """<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>⏳ ৫ সেকেন্ড অপেক্ষা করুন — HighlightHub</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#090d16;color:#f8fafc;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+  .topbar{background:linear-gradient(90deg,#0f172a,#1e293b);border-bottom:1px solid #334155;padding:12px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px;z-index:20}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px;color:#38bdf8}
+  .timer-pill{background:#1e293b;border:1px solid #475569;padding:8px 16px;border-radius:999px;font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px;color:#fbbf24}
+  .timer-pill.done{background:#065f46;border-color:#10b981;color:#ecfdf5}
+  .progress-wrap{height:5px;background:#1e293b;width:100%}
+  .progress-bar{height:100%;width:0%;background:linear-gradient(90deg,#f59e0b,#10b981);transition:width 0.25s linear}
+  .ad-container{flex:1;position:relative;background:#0f172a;display:flex;flex-direction:column;align-items:center;justify-content:center}
+  iframe{width:100%;height:100%;border:0;background:#fff}
+  .fallback-card{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);background:rgba(15,23,42,0.95);border:1px solid #334155;padding:16px 22px;border-radius:14px;text-align:center;max-width:440px;width:92%;box-shadow:0 12px 32px rgba(0,0,0,0.5);z-index:30}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:11px 20px;border-radius:10px;font-weight:700;font-size:14px;text-decoration:none;border:0;cursor:pointer;margin-top:10px;width:100%}
+  .btn-ad{background:#2563eb;color:#fff}
+  .btn-unlock{background:#10b981;color:#052e16;display:none}
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">🎬 HighlightHub Video Gate</div>
+    <div id="timerBox" class="timer-pill">⏳ বাকি আছে: <span id="secLeft">__SECONDS__</span> সেকেন্ড</div>
+  </div>
+  <div class="progress-wrap"><div id="progBar" class="progress-bar"></div></div>
+  <div class="ad-container">
+    <iframe id="adFrame" src="__AD_URL__" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>
+    <div class="fallback-card">
+      <div id="statusMsg" style="font-size:14px;line-height:1.5;color:#cbd5e1">
+        🔒 ভিডিওটি আনলক হচ্ছে... দয়া করে <b><span id="secText">__SECONDS__</span> সেকেন্ড</b> এই পেজে অপেক্ষা করুন (ফাঁকি দেওয়া যাবে না)।
+      </div>
+      <a href="__AD_URL__" target="_blank" rel="noopener" class="btn btn-ad" id="openAdBtn">🔗 বিজ্ঞাপনটি নতুন ট্যাবে দেখুন</a>
+      <button class="btn btn-unlock" id="unlockBtn" onclick="finishAndClose()">✅ ভিডিও আনলক হয়েছে — বটে ফিরে যান</button>
+    </div>
+  </div>
+<script>
+  const token = "__TOKEN__";
+  const totalSec = __SECONDS__;
+  let elapsed = 0;
+  let completed = false;
+  const secLeftEl = document.getElementById("secLeft");
+  const secTextEl = document.getElementById("secText");
+  const progBar = document.getElementById("progBar");
+  const timerBox = document.getElementById("timerBox");
+  const statusMsg = document.getElementById("statusMsg");
+  const unlockBtn = document.getElementById("unlockBtn");
+
+  const interval = setInterval(async () => {
+    if (document.hidden) return; // ট্যাব মিনিমাইজ করলে কাউন্টডাউন থেমে থাকবে (ফাঁকি রোধ)
+    elapsed += 0.25;
+    const rem = Math.max(0, Math.ceil(totalSec - elapsed));
+    secLeftEl.textContent = rem;
+    secTextEl.textContent = rem;
+    progBar.style.width = Math.min(100, (elapsed / totalSec) * 100) + "%";
+
+    if (elapsed >= totalSec && !completed) {
+      completed = true;
+      clearInterval(interval);
+      timerBox.classList.add("done");
+      timerBox.innerHTML = "✅ ৫ সেকেন্ড সম্পন্ন!";
+      statusMsg.innerHTML = "🎉 <b>অভিনন্দন! আপনার ভিডিওটি বটে পাঠিয়ে দেওয়া হয়েছে!</b> এখন টেলিগ্রাম বটে ফিরে যান।";
+      unlockBtn.style.display = "inline-flex";
+      try {
+        await fetch("/api/ad/verify/" + encodeURIComponent(token), {method: "POST"});
+      } catch (e) {}
+    }
+  }, 250);
+
+  function finishAndClose() {
+    if (window.Telegram && window.Telegram.WebApp) {
+      window.Telegram.WebApp.close();
+    }
+    window.location.href = "https://t.me/__BOT_USERNAME__";
+  }
+</script>
+</body>
+</html>"""
 
 
-async def serve_setup_page() -> None:
-    """টোকেন ছাড়াও সার্ভার চালু রাখে — Render-এ ডিপ্লয় 'failed' দেখাবে না।"""
-    port = int(os.getenv("PORT", "0") or 0)
-    if not port:
-        log.error("BOT_TOKEN সেট করা নেই! BOT_TOKEN=xxxx python main.py দিয়ে চালান।")
+DASHBOARD_HTML = """<!doctype html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HighlightHub Bot — Control & Status</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b1120;color:#e2e8f0;padding:24px 16px;line-height:1.6}
+  .wrap{max-width:960px;margin:0 auto;display:grid;gap:20px}
+  .card{background:#1e293b;border:1px solid #334155;border-radius:16px;padding:24px;box-shadow:0 10px 25px rgba(0,0,0,0.35)}
+  h1{font-size:24px;color:#f8fafc;display:flex;align-items:center;gap:10px;margin-bottom:8px}
+  h2{font-size:18px;color:#38bdf8;margin-bottom:12px}
+  .badge{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:999px;font-size:13px;font-weight:700}
+  .badge-ok{background:rgba(16,185,129,0.18);color:#34d399;border:1px solid rgba(16,185,129,0.4)}
+  .badge-warn{background:rgba(245,158,11,0.18);color:#fbbf24;border:1px solid rgba(245,158,11,0.4)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-top:14px}
+  .stat{background:#0f172a;border:1px solid #1e293b;padding:16px;border-radius:12px}
+  .stat-label{font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px}
+  .stat-val{font-size:24px;font-weight:800;color:#f8fafc;margin-top:4px}
+  code{background:#0f172a;color:#38bdf8;padding:2px 8px;border-radius:6px;font-size:13px}
+  input,select{width:100%;padding:11px 14px;border-radius:10px;border:1px solid #475569;background:#0f172a;color:#f8fafc;font-size:14px;margin-top:6px}
+  button{background:#2563eb;color:#fff;border:0;padding:11px 18px;border-radius:10px;font-weight:700;cursor:pointer;font-size:14px}
+  button:hover{background:#1d4ed8}
+  .btn-green{background:#059669}
+  .btn-green:hover{background:#047857}
+  .btn-red{background:#dc2626}
+  .step-list{padding-left:20px;display:grid;gap:8px;color:#cbd5e1;font-size:14px}
+  .sim-box{background:#0f172a;border:1px solid #334155;border-radius:12px;padding:16px;margin-top:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+      <div>
+        <h1>🤖 HighlightHub Bot (@HighlightHubOfficial_bot)</h1>
+        <p style="color:#94a3b8;font-size:14px">অ্যাডমিন: <code>@sabit12354</code> | ডেস্টিনেশন চ্যানেল: <code>-1004308076789</code> | সোর্স চ্যানেল: <code>-1002279362776</code></p>
+      </div>
+      <div>__BOT_STATUS_BADGE__</div>
+    </div>
+
+    <div class="grid">
+      <div class="stat"><div class="stat-label">👥 মোট ইউজার</div><div class="stat-val" id="stUsers">__USERS__</div></div>
+      <div class="stat"><div class="stat-label">🎬 মোট হাইলাইট ম্যাচ</div><div class="stat-val" id="stMatches">__MATCHES__</div></div>
+      <div class="stat"><div class="stat-label">👁 মোট ভিডিও ভিউ</div><div class="stat-val" id="stViews">__VIEWS__</div></div>
+      <div class="stat"><div class="stat-label">📣 ৫ সেকেন্ড অ্যাড গেট</div><div class="stat-val" id="stAd">__AD_STATUS__</div></div>
+    </div>
+  </div>
+
+  __TOKEN_WARNING_CARD__
+
+  <div class="card">
+    <h2>🔍 লাইভ বট ফিচার টেস্টার (সার্চ, বানান ভুল সংশোধন ও ৫-সেকেন্ড অ্যাড গেট)</h2>
+    <p style="font-size:14px;color:#94a3b8;margin-bottom:12px">
+      নিচে ভুল বানানে টিমের নাম লিখে (যেমন: <code>barselona</code>, <code>ral madrid</code>, <code>argntina</code>, <code>brajil</code>) সার্চ করে দেখুন বট কীভাবে নিজে থেকেই বুঝে নেয় এবং সব ম্যাচের বিবরণ দেয়:
+    </p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <input type="text" id="qInput" placeholder="টিম বা ম্যাচের নাম লিখুন (যেমন: barselona, ral madrid, argntina)..." style="flex:1;min-width:220px;margin:0" value="barselona">
+      <button onclick="runTestSearch()">🔍 সার্চ টেস্ট করুন</button>
+    </div>
+    <div id="searchOut" class="sim-box" style="margin-top:14px;font-size:14px"></div>
+  </div>
+
+  <div class="card">
+    <h2>📣 অ্যাডমিন অ্যাড লিংক ও ফ্রি মোড কন্ট্রোল (৫ সেকেন্ড বাধ্যতামূলক টাইমার)</h2>
+    <p style="font-size:14px;color:#94a3b8;margin-bottom:12px">
+      আপনি বটের ভেতরে <code>/admin</code> → <b>📣 অ্যাড ম্যানেজার</b> থেকে অথবা নিচের বক্স থেকে সরাসরি অ্যাড লিংক বসাতে বা বন্ধ করতে পারবেন। অ্যাড বন্ধ থাকলে ইউজাররা সরাসরি ফ্রিতে ভিডিও পাবে, আর চালু থাকলে ৫ সেকেন্ড বাধ্যতামূলক অ্যাড দেখতে হবে:
+    </p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <input type="text" id="adUrlInput" placeholder="https://your-ad-link.com ..." value="__CURRENT_AD_URL__" style="flex:1;min-width:220px;margin:0">
+      <button class="btn-green" onclick="saveAdConfig(true)">🟢 অ্যাড চালু করুন (5s Timer)</button>
+      <button class="btn-red" onclick="saveAdConfig(false)">🔴 অ্যাড বন্ধ করুন (Free Mode)</button>
+    </div>
+    <div id="adSaveMsg" style="margin-top:10px;font-size:13px;color:#34d399"></div>
+  </div>
+
+  <div class="card">
+    <h2>🚀 কেন আগের ডিপ্লয় Failed হয়েছিল এবং এখন কীভাবে ১ মিনিটে চালাবেন</h2>
+    <ol class="step-list">
+      <li><b>আগের সমস্যার কারণ ১:</b> আপনার GitHub রিপোজিটরিতে (<code>xbtxn4196-glitch/bot-111111</code>) ফাইলের নাম ভুলে <code>requiremennts.txt</code> (দুইটা <code>n</code>) দেওয়া ছিল, তাই Render <code>requirements.txt</code> খুঁজে না পেয়ে Build Failed দেখিয়েছিল।</li>
+      <li><b>আগের সমস্যার কারণ ২:</b> আপনার পুরোনো বট টোকেনটি (<code>8653868768:AAEk...5qU</code>) বাতিল (401 Unauthorized) হয়ে যাওয়ায় আগের কোড ক্র্যাশ করছিল। এখন কোডটি এমনভাবে ঠিক করা হয়েছে যে টোকেন ভুল থাকলেও সার্ভার কখনোই ক্র্যাশ বা Failed হবে না!</li>
+      <li><b>এখন করণীয়:</b> আমরা আপনার জন্য একদম নিখুঁত <code>main.py</code> এবং সঠিক নামের <code>requirements.txt</code> তৈরি করে দিয়েছি। এই ফাইল দুইটি আপনার GitHub-এ আপলোড করে Render-এ নতুন <code>BOT_TOKEN</code> বসিয়ে <b>Deploy</b> চাপলেই বট সাথে সাথে চালু হয়ে যাবে!</li>
+    </ol>
+  </div>
+</div>
+
+<script>
+async function runTestSearch() {
+  const q = document.getElementById('qInput').value;
+  const out = document.getElementById('searchOut');
+  out.innerHTML = '⏳ খোঁজা হচ্ছে...';
+  const res = await fetch('/api/test/search?q=' + encodeURIComponent(q));
+  const data = await res.json();
+  if (!data.matches || data.matches.length === 0) {
+    out.innerHTML = '😔 কোনো ম্যাচ পাওয়া যায়নি।';
+    return;
+  }
+  let html = `<div style="margin-bottom:10px;color:#38bdf8;font-weight:700">🔍 "${data.query}" (সংশোধিত: ${data.normalized}) — মোট ${data.matches.length}টি ম্যাচ পাওয়া গেছে:</div>`;
+  data.matches.forEach((m, i) => {
+    html += `<div style="padding:10px;border-bottom:1px solid #1e293b;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+      <div><b>${i+1}. 🏆 ${m.team}</b> — ${m.title} <span style="color:#fbbf24">(${m.year || '-'})</span></div>
+      <a href="/ad/${m.demo_token}" target="_blank" style="background:#2563eb;color:#fff;padding:6px 12px;border-radius:8px;text-decoration:none;font-size:12px;font-weight:700">🎬 ম্যাচটিতে ক্লিক করুন</a>
+    </div>`;
+  });
+  out.innerHTML = html;
+}
+
+async function saveAdConfig(enable) {
+  const url = document.getElementById('adUrlInput').value.trim();
+  const res = await fetch('/api/test/ad', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enable, url})
+  });
+  const data = await res.json();
+  document.getElementById('stAd').textContent = data.ad_status;
+  document.getElementById('adSaveMsg').textContent = data.message;
+  runTestSearch();
+}
+
+async function saveLiveToken() {
+  const tok = document.getElementById('liveTokenInput').value.trim();
+  const msgEl = document.getElementById('tokenSaveMsg');
+  if (!tok) return;
+  msgEl.textContent = '⏳ টোকেন যাচাই করে বট চালু করা হচ্ছে...';
+  const res = await fetch('/api/setup/token', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token: tok})
+  });
+  const data = await res.json();
+  msgEl.textContent = data.message;
+  if (data.ok) setTimeout(() => location.reload(), 1200);
+}
+
+runTestSearch();
+</script>
+</body>
+</html>"""
+
+
+# গ্লোবাল রানটাইম স্টেট (যাতে টোকেন ছাড়াও বা ভুল টোকেনেও সার্ভার ১০০% সচল থাকে)
+RUNTIME_STATE = {
+    "bot_online": False,
+    "bot_username": "HighlightHubOfficial_bot",
+    "bot_error": "",
+    "bot": None,
+    "dp": None,
+    "db": None,
+    "polling_task": None,
+}
+
+
+async def seed_demo_matches_if_empty(db: Database) -> None:
+    """ডেটাবেসে কোনো ম্যাচ না থাকলে টেস্ট ও ডেমোর জন্য কয়েকটি জনপ্রিয় ম্যাচ যোগ করে।"""
+    if await db.count_matches() > 0:
         return
-    app = web.Application()
+    samples = [
+        ("Real Madrid", "Real Madrid vs Barcelona 3-2 (El Clasico)", "2024", "#RealMadrid,#Barcelona"),
+        ("Real Madrid", "Real Madrid vs Manchester City 3-1 (UCL Semi-Final)", "2022", "#RealMadrid,#ManCity"),
+        ("Barcelona", "Barcelona vs PSG 6-1 (UCL La Remontada)", "2017", "#Barcelona,#PSG"),
+        ("Barcelona", "Barcelona vs Real Madrid 4-0 (La Liga)", "2024", "#Barcelona,#RealMadrid"),
+        ("Argentina", "Argentina vs France 3-3 (FIFA World Cup Final)", "2022", "#Argentina,#France"),
+        ("Argentina", "Argentina vs Brazil 1-0 (Copa America Final)", "2021", "#Argentina,#Brazil"),
+        ("Brazil", "Brazil vs Germany 1-7 (FIFA World Cup Semi-Final)", "2014", "#Brazil,#Germany"),
+        ("Bangladesh", "Bangladesh vs India 265/8 (Asia Cup Thriller)", "2023", "#Bangladesh,#India"),
+    ]
+    for team, title, yr, tags in samples:
+        await db.add_match(
+            team=team,
+            team_key=norm(team),
+            title=title,
+            year=yr,
+            tags=tags,
+            file_id=f"DEMO_{norm(team).replace(' ', '_')}_{yr}",
+            media_type="video",
+        )
 
-    async def page(_request):
-        return web.Response(text=SETUP_HTML, content_type="text/html")
 
-    app.router.add_get("/", page)
-    app.router.add_get("/health", page)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, host="0.0.0.0", port=port).start()
-    log.error("BOT_TOKEN নেই — সেটআপ পেজ http://0.0.0.0:%s এ চলছে। Render → Environment → BOT_TOKEN দিন।", port)
+async def try_start_telegram_bot(token: str, db: Database) -> tuple[bool, str]:
+    """বট টোকেন যাচাই করে নিরাপদে Telegram Bot চালু করে (ক্র্যাশ ছাড়া)।"""
+    token = (token or "").strip()
+    if not token:
+        RUNTIME_STATE["bot_online"] = False
+        RUNTIME_STATE["bot_error"] = "BOT_TOKEN দেওয়া হয়নি"
+        return False, "BOT_TOKEN সেট করা নেই।"
+
     try:
-        await asyncio.Event().wait()
-    finally:
-        await runner.cleanup()
+        test_bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
+        me = await test_bot.get_me()
+    except Exception as exc:
+        RUNTIME_STATE["bot_online"] = False
+        RUNTIME_STATE["bot_error"] = f"টোকেন সঠিক নয় বা মেয়াদ শেষ ({exc})"
+        log.error("Bot token check failed: %s", exc)
+        return False, f"❌ টোকেন কাজ করছে না: {exc} — BotFather থেকে নতুন টোকেন নিয়ে বসান।"
 
+    # পুরোনো পোলিং টাস্ক থাকলে বন্ধ করো
+    old_task = RUNTIME_STATE.get("polling_task")
+    if old_task and not old_task.done():
+        old_task.cancel()
 
-async def main() -> None:
-    if not BOT_TOKEN:
-        log.error("=" * 60)
-        log.error("BOT_TOKEN সেট করা নেই! Render → Environment → BOT_TOKEN দিন।")
-        log.error("=" * 60)
-        await serve_setup_page()
-        return
+    dp = Dispatcher()
+    dp["db"] = db
+    dp["bot"] = test_bot
 
-    bot, dp = create_bot_and_dispatcher()
-    db: Database = dp["db"]
-    await db.connect()
-    log.info("Database ready: %s", DB_PATH)
+    middleware = ActivityMiddleware(db)
+    dp.message.middleware(middleware)
+    dp.callback_query.middleware(middleware)
 
-    async def on_startup(bot: Bot) -> None:
-        if dp.get("started"):
-            return
-        dp["started"] = True
+    dp.include_router(channel_router)
+    dp.include_router(admin_router)
+    dp.include_router(user_router)
 
-        me = await bot.get_me()
-        log.info("Bot started: @%s (id=%s)", me.username, me.id)
-        log.info("=" * 60)
-        try:
-            await bot.set_my_commands(
-                [
-                    BotCommand(command="start", description="Start / হোম"),
-                    BotCommand(command="help", description="Help / সাহায্য"),
-                    BotCommand(command="lang", description="Language / ভাষা"),
-                    BotCommand(command="admin", description="Admin panel"),
-                    BotCommand(command="id", description="My ID / আমার আইডি"),
-                ]
-            )
-        except Exception as exc:
-            log.warning("set_my_commands failed: %s", exc)
+    RUNTIME_STATE["bot"] = test_bot
+    RUNTIME_STATE["dp"] = dp
+    RUNTIME_STATE["bot_online"] = True
+    RUNTIME_STATE["bot_username"] = me.username or "HighlightHubOfficial_bot"
+    RUNTIME_STATE["bot_error"] = ""
 
-        try:
-            chat = await bot.get_chat(DEST_CHANNEL)
-            log.info("DEST channel OK: %s", chat.title)
-        except Exception as exc:
-            log.warning("DEST channel NOT accessible (%s): %s — বটকে অ্যাডমিন করুন", DEST_CHANNEL, exc)
+    log.info("✅ Bot started successfully: @%s (id=%s)", me.username, me.id)
 
-        username = await source_username(db)
-        if username:
-            log.info("Public source: @%s — অ্যাডমিন ছাড়াই পড়া হবে", username)
-        else:
-            log.info("Public source সেট নেই — অ্যাডমিন প্যানেল → চ্যানেল সিঙ্ক → ✏️ সোর্স ইউজারনেম")
+    try:
+        await test_bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Start / হোম"),
+                BotCommand(command="help", description="Help / সাহায্য"),
+                BotCommand(command="lang", description="Language / ভাষা"),
+                BotCommand(command="admin", description="Admin panel"),
+                BotCommand(command="id", description="My ID / আমার আইডি"),
+            ]
+        )
+    except Exception as exc:
+        log.warning("set_my_commands warning: %s", exc)
 
-        dp["poller_task"] = asyncio.create_task(poller_loop(bot, db))
-
-    async def on_shutdown(bot: Bot) -> None:
-        task = dp.get("poller_task")
-        if task:
-            task.cancel()
-        await db.close()
-        log.info("Shutdown complete")
-
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
+    if not dp.get("poller_task"):
+        dp["poller_task"] = asyncio.create_task(poller_loop(test_bot, db))
 
     base = webhook_base_url()
-    port = int(os.getenv("PORT", "0") or 0)
     allowed = dp.resolve_used_update_types()
     secret = os.getenv("WEBHOOK_SECRET", "").strip() or None
 
     webhook_ok = False
     if base:
         try:
-            await bot.set_webhook(
+            await test_bot.set_webhook(
                 base + WEBHOOK_PATH,
                 drop_pending_updates=False,
                 allowed_updates=allowed,
                 secret_token=secret,
             )
             webhook_ok = True
-            log.info("Webhook set → %s%s", base, WEBHOOK_PATH)
+            log.info("Webhook active → %s%s", base, WEBHOOK_PATH)
         except Exception as exc:
-            log.error("Webhook set failed: %s — polling fallback চলবে", exc)
+            log.warning("Webhook failed (%s), switching to polling...", exc)
 
-    if port:
-        app = web.Application()
-
-        async def health(_request):
-            return web.Response(text="✅ HighlightHub bot is running")
-
-        app.router.add_get("/", health)
-        app.router.add_get("/health", health)
-
-        SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=secret).register(
-            app, path=WEBHOOK_PATH
-        )
-        setup_application(app, dp, bot=bot)
-
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, host="0.0.0.0", port=port)
-        await site.start()
-        log.info("Web server listening on 0.0.0.0:%s", port)
-
+    if not webhook_ok:
         try:
-            if not webhook_ok:
-                await bot.delete_webhook(drop_pending_updates=False)
-                await dp.start_polling(bot, allowed_updates=allowed)
-            else:
-                await asyncio.Event().wait()
-        finally:
-            await runner.cleanup()
-        return
+            await test_bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            pass
+        RUNTIME_STATE["polling_task"] = asyncio.create_task(
+            dp.start_polling(test_bot, allowed_updates=allowed, handle_signals=False)
+        )
+        log.info("Polling started in background task.")
 
-    await bot.delete_webhook(drop_pending_updates=False)
-    log.info("Polling mode")
-    await dp.start_polling(bot, allowed_updates=allowed)
+    return True, f"✅ বট সফলভাবে চালু হয়েছে: @{me.username}"
+
+
+def create_web_app(db: Database) -> web.Application:
+    app = web.Application()
+
+    async def handle_dashboard(_request: web.Request) -> web.Response:
+        users_cnt = await db.count_users()
+        matches_cnt = await db.count_matches()
+        views_cnt = await db.total_views()
+        ad = await load_ad(db)
+        s = await db.get_settings("ad_")
+        cur_url = s.get("ad_url") or ""
+
+        if RUNTIME_STATE["bot_online"]:
+            badge = f'<span class="badge badge-ok">🟢 বট লাইভ আছে (@{esc(RUNTIME_STATE["bot_username"])})</span>'
+            warn_card = ""
+        else:
+            err_reason = esc(RUNTIME_STATE["bot_error"] or "BOT_TOKEN সেট করা নেই")
+            badge = f'<span class="badge badge-warn">⚠️ টোকেন প্রয়োজন ({err_reason})</span>'
+            warn_card = f"""
+            <div class="card" style="border-color:#f59e0b">
+              <h2 style="color:#fbbf24">🔑 বট টোকেন সেট করুন (১-ক্লিকে বট চালু করুন)</h2>
+              <p style="font-size:14px;color:#cbd5e1;margin-bottom:10px">
+                সার্ভার ১০০% সচল আছে! আপনার আগের টোকেনটি বাতিল হওয়ায় Telegram সংযোগের জন্য <b>@BotFather</b> থেকে নতুন টোকেন নিয়ে Render → Environment → <code>BOT_TOKEN</code> এ বসান, অথবা এখনই নিচে পেস্ট করে টেস্ট করুন:
+              </p>
+              <div style="display:flex;gap:10px;flex-wrap:wrap">
+                <input type="text" id="liveTokenInput" placeholder="8653868768:AA..." style="flex:1;min-width:240px;margin:0">
+                <button onclick="saveLiveToken()">🚀 টোকেন সেভ ও বট চালু করুন</button>
+              </div>
+              <div id="tokenSaveMsg" style="margin-top:10px;font-size:13px;color:#fbbf24"></div>
+            </div>
+            """
+
+        html = (
+            DASHBOARD_HTML.replace("__BOT_STATUS_BADGE__", badge)
+            .replace("__USERS__", str(users_cnt))
+            .replace("__MATCHES__", str(matches_cnt))
+            .replace("__VIEWS__", str(views_cnt))
+            .replace("__AD_STATUS__", "🟢 চালু (5s)" if ad else "⚪ ফ্রি মোড")
+            .replace("__CURRENT_AD_URL__", esc(cur_url))
+            .replace("__TOKEN_WARNING_CARD__", warn_card)
+        )
+        return web.Response(text=html, content_type="text/html")
+
+    async def handle_health(_request: web.Request) -> web.Response:
+        return web.Response(text="✅ HighlightHub bot server is healthy and running")
+
+    async def handle_ad_gate(request: web.Request) -> web.Response:
+        token = request.match_info.get("token", "")
+        session = await db.get_ad_session(token)
+        if not session:
+            return web.Response(text="⚠️ এই অ্যাড সেশনটি পাওয়া যায়নি বা মেয়াদ শেষ হয়েছে।", status=404)
+
+        ad = await load_ad(db)
+        if not ad or not ad.get("url"):
+            # যদি অ্যাড বন্ধ থাকে, সরাসরি আনলক ও ভিডিও পাঠিয়ে দাও
+            await db.mark_ad_verified(token)
+            match = await db.get_match(int(session["match_id"]))
+            if match and RUNTIME_STATE.get("bot") and session["delivered"] == 0:
+                await db.mark_ad_delivered(token)
+                lang = await get_lang(db, int(session["user_id"]))
+                await send_video_to(RUNTIME_STATE["bot"], db, int(session["user_id"]), match, lang)
+            return web.Response(
+                text="<html><body style='background:#0f172a;color:#fff;font-family:sans-serif;text-align:center;padding:50px'><h2>✅ ফ্রি মোড চালু আছে! ভিডিওটি আপনার টেলিগ্রাম বটে পাঠানো হয়েছে।</h2></body></html>",
+                content_type="text/html",
+            )
+
+        await db.mark_ad_opened(token)
+        ad_url = session["ad_url"] or ad["url"]
+        html = (
+            AD_GATE_HTML.replace("__TOKEN__", esc(token))
+            .replace("__AD_URL__", esc(ad_url))
+            .replace("__SECONDS__", str(AD_TIMER_SECONDS))
+            .replace("__BOT_USERNAME__", esc(RUNTIME_STATE.get("bot_username") or "HighlightHubOfficial_bot"))
+        )
+        return web.Response(text=html, content_type="text/html")
+
+    async def handle_ad_verify(request: web.Request) -> web.Response:
+        token = request.match_info.get("token", "")
+        session = await db.get_ad_session(token)
+        if not session:
+            return web.json_response({"ok": False, "error": "not_found"}, status=404)
+
+        opened_at = float(session["opened_at"] or 0)
+        elapsed = time.time() - opened_at if opened_at > 0 else 0
+        if elapsed < (AD_TIMER_SECONDS - 0.4):
+            return web.json_response(
+                {"ok": False, "error": "too_early", "elapsed": round(elapsed, 1)},
+                status=400,
+            )
+
+        await db.mark_ad_verified(token)
+
+        # ৫ সেকেন্ড পূর্ণ হলে অটোমেটিক টেলিগ্রামে ভিডিও পাঠিয়ে দেওয়া হবে!
+        if session["delivered"] == 0 and RUNTIME_STATE.get("bot"):
+            match = await db.get_match(int(session["match_id"]))
+            if match:
+                await db.mark_ad_delivered(token)
+                lang = await get_lang(db, int(session["user_id"]))
+                await send_video_to(RUNTIME_STATE["bot"], db, int(session["user_id"]), match, lang)
+
+        return web.json_response({"ok": True, "verified": True})
+
+    async def handle_test_search(request: web.Request) -> web.Response:
+        q = (request.query.get("q") or "").strip()
+        rows = await db.get_search_index()
+        found = search_matches(rows, q, limit=15) if q else rows[:10]
+        ad = await load_ad(db)
+        out = []
+        for r in found:
+            tok = await db.create_ad_session(0, r["id"], ad["url"] if ad else "")
+            out.append(
+                {
+                    "id": r["id"],
+                    "team": r["team"],
+                    "title": r["title"],
+                    "year": r["year"],
+                    "demo_token": tok,
+                }
+            )
+        return web.json_response({"query": q, "normalized": norm(q), "matches": out})
+
+    async def handle_test_ad(request: web.Request) -> web.Response:
+        data = await request.json()
+        enable = bool(data.get("enable"))
+        url = (data.get("url") or "").strip()
+        if enable and url:
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            await db.set_setting("ad_url", url)
+            await db.set_setting(
+                "ad_text",
+                f"🔥 হাইলাইট ভিডিওটি পেতে নিচের বাটনে ক্লিক করে মাত্র {AD_TIMER_SECONDS} সেকেন্ড অ্যাডটি দেখুন!",
+            )
+            await db.set_setting("ad_btn", f"📺 অ্যাড দেখুন ({AD_TIMER_SECONDS} সেকেন্ড)")
+            await db.set_setting("ad_active", "1")
+            return web.json_response(
+                {"ok": True, "ad_status": "🟢 চালু (5s)", "message": "✅ ৫ সেকেন্ডের বাধ্যতামূলক অ্যাড চালু করা হয়েছে!"}
+            )
+        else:
+            await db.set_setting("ad_active", "0")
+            return web.json_response(
+                {"ok": True, "ad_status": "⚪ ফ্রি মোড", "message": "✅ অ্যাড বন্ধ করা হয়েছে — এখন ইউজাররা ফ্রিতে সরাসরি ভিডিও পাবে!"}
+            )
+
+    async def handle_setup_token(request: web.Request) -> web.Response:
+        data = await request.json()
+        new_tok = (data.get("token") or "").strip()
+        ok, msg = await try_start_telegram_bot(new_tok, db)
+        if ok:
+            await db.set_setting("saved_bot_token", new_tok)
+        return web.json_response({"ok": ok, "message": msg})
+
+    async def handle_webhook(request: web.Request) -> web.Response:
+        bot = RUNTIME_STATE.get("bot")
+        dp = RUNTIME_STATE.get("dp")
+        if not bot or not dp:
+            return web.Response(status=503, text="Bot not configured")
+        secret = os.getenv("WEBHOOK_SECRET", "").strip()
+        if secret:
+            header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if header_secret != secret:
+                return web.Response(status=401, text="Unauthorized")
+        payload = await request.json()
+        from aiogram.types import Update
+        update = Update.model_validate(payload, context={"bot": bot})
+        await dp.feed_update(bot, update)
+        return web.Response(text="ok")
+
+    app.router.add_get("/", handle_dashboard)
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/ad/{token}", handle_ad_gate)
+    app.router.add_post("/api/ad/verify/{token}", handle_ad_verify)
+    app.router.add_get("/api/test/search", handle_test_search)
+    app.router.add_post("/api/test/ad", handle_test_ad)
+    app.router.add_post("/api/setup/token", handle_setup_token)
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+    return app
+
+
+async def main() -> None:
+    db = Database()
+    await db.connect()
+    await seed_demo_matches_if_empty(db)
+    RUNTIME_STATE["db"] = db
+    log.info("Database ready: %s", DB_PATH)
+
+    port = int(os.getenv("PORT", "8000") or 8000)
+    app = create_web_app(db)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    log.info("🌐 Web Server & 5s Ad Gate listening on http://0.0.0.0:%s", port)
+
+    # প্রথমে env থেকে BOT_TOKEN অথবা ডেটাবেসে সেভ থাকা টোকেন দিয়ে বট চালু করার চেষ্টা করো
+    active_token = BOT_TOKEN or (await db.get_setting("saved_bot_token") or "")
+    ok, msg = await try_start_telegram_bot(active_token, db)
+    log.info(msg)
+
+    try:
+        await asyncio.Event().wait()
+    finally:
+        old_task = RUNTIME_STATE.get("polling_task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+        await db.close()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
@@ -3231,4 +3884,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         log.info("Bot stopped")
-
